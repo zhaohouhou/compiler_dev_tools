@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-optdump2cfg.py — 把 LLVM opt -print-before/-print-after 的文本输出画成 CFG 图（PDF）。
+opt_dump_to_cfg.py — 把 LLVM IR / Machine IR 的 pass dump 画成 CFG 图（PDF）。
 
 用法（opt 的 dump 打到 stderr，重定向用 2>）：
 
     opt -O2 -print-after=reassociate test.ll -o /dev/null 2> dump.txt
-    python3 optdump2cfg.py dump.txt
-    python3 optdump2cfg.py dump.txt -o out/foo
-    python3 optdump2cfg.py dump.txt -f '^main$' --names-only
-    python3 optdump2cfg.py dump.txt --backedge-color green
+    python3 opt_dump_to_cfg.py dump.txt
+    python3 opt_dump_to_cfg.py dump.txt -o out/foo
+    python3 opt_dump_to_cfg.py dump.txt -f '^main$' --names-only
+    python3 opt_dump_to_cfg.py dump.txt --backedge-color green
+    python3 opt_dump_to_cfg.py before-machine-sink_dump.log
 
 输入约定：一次喂一个 pass 的 dump，可以含多个函数、多个 banner
 （比如 before+after 各一个）。
+支持 opt 的 LLVM IR dump 和 llc 的 Machine IR dump。Machine IR 的边取自
+successors 行，基本块名保留 bb.N 后面的标签。
 
 banner 行两种格式都认：
     裸 stderr 格式：  *** IR Dump After ReassociatePass ***
@@ -49,9 +52,14 @@ import sys
 # ---------------------------------------------------------------------------
 
 BANNER_RE = re.compile(
-    r'^\s*;?\s*\*{3}\s*IR Dump (Before|After)\s+(.*?)'
-    r'(?:\s+on\s+([\w.$-]+))?\s*\*{3}\s*$'
+    r'^\s*[;#]?\s*\*{3}\s*IR Dump (Before|After)\s+(.*?)'
+    r'(?:\s+on\s+([\w.$-]+))?\s*\*{3}:?\s*$'
 )
+MACHINE_FUNC_RE = re.compile(r'^# Machine code for function (\S+):(?:\s|$)')
+MACHINE_END_RE = re.compile(r'^# End machine code for function\b')
+MACHINE_LABEL_RE = re.compile(r'^(bb\.\d+(?:\.[^:]+)?):\s*$')
+MACHINE_SUCCESSORS_RE = re.compile(r'^\s*successors:\s*(.*)$')
+MACHINE_REF_RE = re.compile(r'%bb\.\d+\b')
 
 # define 开头（declare 不算，declare 没有函数体）
 DEFINE_RE = re.compile(r'^\s*define\b')
@@ -137,6 +145,21 @@ def parse_dump(text):
             cur_fn = None
             continue
 
+        m = MACHINE_FUNC_RE.match(raw)
+        if m:
+            if cur_grp is None:
+                cur_grp = {'phase': '', 'pass': '', 'banner_fn': None, 'functions': []}
+                groups.append(cur_grp)
+            cur_fn = {'header': raw.strip(), 'name': m.group(1),
+                      'lines': [], 'machine': True}
+            cur_grp['functions'].append(cur_fn)
+            header_pending = False
+            continue
+
+        if MACHINE_END_RE.match(raw):
+            cur_fn = None
+            continue
+
         if DEFINE_RE.match(raw):
             if cur_grp is None:
                 # 没有 banner 的裸 IR：全部归一个匿名组，按函数切图
@@ -167,6 +190,9 @@ def parse_dump(text):
     for grp in groups:
         multi = len(grp['functions']) > 1
         for fn in grp['functions']:
+            if fn.get('machine'):
+                fn['blocks'] = parse_machine_blocks(fn['lines'])
+                continue
             m = FUNC_NAME_RE.search(fn['header'])
             define_name = unquote(m.group(1)) if m else None
             # banner 带 on 函数名且组里只有一个函数时，以 banner 为准；
@@ -202,6 +228,35 @@ def parse_blocks(lines):
     return blocks
 
 
+def parse_machine_blocks(lines):
+    """解析 Machine IR；successors 行提供 CFG 边，块标签保留原名。"""
+    blocks = []
+    cur = None
+    for line in lines:
+        m = MACHINE_LABEL_RE.match(line)
+        if m:
+            cur = {'name': m.group(1), 'instrs': [], 'successors': []}
+            blocks.append(cur)
+            continue
+        if cur is None:
+            continue
+        m = MACHINE_SUCCESSORS_RE.match(line)
+        if m:
+            # 分号后是同一批后继的百分比说明，不能重复计边。
+            refs = MACHINE_REF_RE.findall(m.group(1).split(';', 1)[0])
+            cur['successors'] = list(dict.fromkeys(refs))
+        elif line.strip() and not line.lstrip().startswith(';'):
+            cur['instrs'].append(line.strip())
+
+    # 后继只带 bb 编号，标签可能还有 .entry 等后缀。
+    names = {b['name'].split('.', 2)[0] + '.' + b['name'].split('.', 2)[1]: b['name']
+             for b in blocks}
+    for block in blocks:
+        block['successors'] = [names.get(ref[1:], ref[1:])
+                               for ref in block['successors']]
+    return blocks
+
+
 def get_edges(block):
     """从一个基本块里提取出边。
 
@@ -209,6 +264,9 @@ def get_edges(block):
     （switch）、normal/unwind（invoke），其余为空串。
     规则按 terminator 类型依次匹配，都不中就走通用路径（抓所有 label %x）。
     """
+    if 'successors' in block:
+        return [(dst, '') for dst in block['successors']]
+
     text = ' '.join(block['instrs'])
 
     m = BR_COND_RE.search(text)
@@ -382,14 +440,14 @@ def safe_name(s):
 
 def main():
     ap = argparse.ArgumentParser(
-        description='把 opt -print-before/-print-after 的 dump 画成 CFG PDF。一次喂一个 pass 的 dump（可含多个函数）。',
+    description='把 LLVM IR / Machine IR 的 pass dump 画成 CFG PDF。一次喂一个 pass 的 dump（可含多个函数）。',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 示例：
   opt -O2 -print-after=reassociate test.ll -o /dev/null 2> dump.txt
-  python3 optdump2cfg.py dump.txt            # 生成 dump.full.pdf 和 dump.names.pdf
-  python3 optdump2cfg.py dump.txt -o out/x   # 生成 out/x.full.pdf 和 out/x.names.pdf
-  python3 optdump2cfg.py dump.txt --names-only -k --backedge-color green
+  python3 opt_dump_to_cfg.py dump.txt            # 生成 dump.full.pdf 和 dump.names.pdf
+  python3 opt_dump_to_cfg.py dump.txt -o out/x   # 生成 out/x.full.pdf 和 out/x.names.pdf
+  python3 opt_dump_to_cfg.py dump.txt --names-only -k --backedge-color green
 ''')
     ap.add_argument('dump', nargs='?', help='dump 文本文件；缺省读 stdin')
     ap.add_argument('-o', '--output', help='输出文件名前缀（默认 <输入去后缀>，stdin 则 cfg）')
@@ -424,7 +482,7 @@ def main():
 
     groups = parse_dump(text)
     if not groups:
-        sys.exit('没在输入里找到函数定义（define）。确认传的是 print-before/print-after 的 dump。')
+        sys.exit('没在输入里找到函数定义（define 或 Machine code for function）。确认传的是 pass dump。')
 
     # 收集所有待渲染项：(标题, 变体名, dot文本)
     items = []
